@@ -1,0 +1,19 @@
+{
+  "folders": [
+    {
+      "name": "Kova Hand Firmware",
+      "path": "firmware"
+    }
+  ],
+  "settings": {
+    "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+    "files.exclude": {
+      "**/.pio": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "platformio.platformio-ide"
+    ]
+  }
+}

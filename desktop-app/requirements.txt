@@ -1,0 +1,5 @@
+bleak>=0.22,<2
+mediapipe>=0.10.31,<0.11
+Pillow>=10,<12
+customtkinter>=5.2,<6
+resvg-py>=0.4,<0.5
