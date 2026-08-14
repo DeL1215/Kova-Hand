@@ -4,13 +4,20 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 
 # PlatformIO
 .pio/
 
+# Models
+/Models/
+/desktop-app/models/
+
 # Editor / OS
 .vscode/
 .idea/
+*.code-workspace
 .DS_Store
 Thumbs.db
 
