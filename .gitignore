@@ -13,6 +13,13 @@ venv/
 # Models
 /Models/
 /desktop-app/models/
+*.3mf
+*.stl
+*.step
+*.stp
+*.obj
+*.glb
+*.gltf
 
 # Editor / OS
 .vscode/
