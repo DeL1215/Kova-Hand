@@ -6,7 +6,7 @@
 // ============================================================
 // Kova Hand：ESP32-C3 + PCA9685 + BLE 六路舵機控制器
 // 單路指令：S,通道,角度\n，例如 S,0,90
-// 四指同步指令：H,馬達0,馬達1,馬達2,馬達3\n，例如 H,0,45,90,180
+// 六馬達同步指令：7 bytes，'B' 後接 channel 0～5 的 uint8 角度。
 // ============================================================
 
 namespace Config {
@@ -64,7 +64,7 @@ void setServoTarget(uint8_t channel, int angle) {
   angle = constrain(angle, 0, 180);
   targetAngles[channel] = angle;
 
-  // 第一次命令也從中位漸進移動，避免四指同時瞬間跳角度的電流尖峰。
+  // 第一次命令也從中位漸進移動，避免多馬達同時瞬間跳角度的電流尖峰。
   if (!servoEnabled[channel]) {
     servoEnabled[channel] = true;
     currentAngles[channel] = Config::SERVO_START_ANGLE_DEG;
@@ -101,22 +101,14 @@ class ServoCommandCallbacks final : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic) override {
     const std::string command = characteristic->getValue();
 
-    int handAngles[4] = {};
-    if (sscanf(
-            command.c_str(),
-            "H,%d,%d,%d,%d",
-            &handAngles[0],
-            &handAngles[1],
-            &handAngles[2],
-            &handAngles[3]) == 4) {
-      for (uint8_t channel = 0; channel < 4; ++channel) {
-        if (handAngles[channel] < 0 || handAngles[channel] > 180) {
-          Serial.println("Hand command out of range");
+    if (command.size() == Config::SERVO_COUNT + 1 && command[0] == 'B') {
+      for (uint8_t channel = 0; channel < Config::SERVO_COUNT; ++channel) {
+        const uint8_t angle = static_cast<uint8_t>(command[channel + 1]);
+        if (angle > 180) {
+          Serial.println("Binary hand command out of range");
           return;
         }
-      }
-      for (uint8_t channel = 0; channel < 4; ++channel) {
-        setServoTarget(channel, handAngles[channel]);
+        setServoTarget(channel, angle);
       }
       return;
     }

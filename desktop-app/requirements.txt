@@ -1,5 +1,6 @@
 bleak>=0.22,<2
 mediapipe>=0.10.31,<0.11
 Pillow>=10,<12
-customtkinter>=5.2,<6
-resvg-py>=0.4,<0.5
+PySide6>=6.7,<7
+openai>=2,<3
+python-dotenv>=1,<2

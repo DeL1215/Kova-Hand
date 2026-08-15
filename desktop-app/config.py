@@ -4,7 +4,7 @@
 """
 
 APP_TITLE = "Kova Hand Control"
-WINDOW_SIZE = "1280x780"
+WINDOW_SIZE = "1280x1020"
 
 # 必須和 ESP32 韌體中的 UUID 完全相同。
 BLE_DEVICE_NAME = "Kova-Hand"
@@ -15,8 +15,11 @@ BLE_CHARACTERISTIC_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214"
 SEND_INTERVAL_MS = 55
 
 # 所有 BLE 馬達命令都由單一寫入器依序傳送，避免 Windows GATT 同時寫入而斷線。
-# 手部控制會把四指合併成一包，40 ms 約為每秒 25 次同步更新。
+# 六個手部控制值會合併成一個 7-byte BLE 封包。
 BLE_WRITE_INTERVAL_MS = 35
+
+# AI 連續動作間的最短間隔，確保每個 BLE 姿勢封包都有時間送出。
+AI_ACTION_INTERVAL_MS = 90
 
 # title: 介面顯示名稱
 # channel: PCA9685 通道（0～15）
@@ -27,8 +30,8 @@ MOTORS = [
     {"title": "馬達 - 中指", "channel": 1, "min": 0, "max": 180, "initial": 90},
     {"title": "馬達 - 無名指", "channel": 2, "min": 0, "max": 180, "initial": 90},
     {"title": "馬達 - 小指", "channel": 3, "min": 0, "max": 180, "initial": 90},
-    {"title": "馬達 4", "channel": 4, "min": 0, "max": 180, "initial": 90},
-    {"title": "馬達 5", "channel": 5, "min": 0, "max": 180, "initial": 90},
+    {"title": "馬達 - 拇指彎曲", "channel": 4, "min": 0, "max": 180, "initial": 90},
+    {"title": "馬達 - 拇指CMC", "channel": 5, "min": 0, "max": 180, "initial": 90},
 ]
 
 CAMERA_INDEX = 0
@@ -39,14 +42,15 @@ HAND_MODEL_PATH = "models/hand_landmarker.task"
 HAND_LABEL_FOR_PHYSICAL_LEFT = "Right"
 
 # MediaPipe 左手腱繩控制。
-# channel 0～3 依序是食指、中指、無名指、小指；馬達 4、5 不受手勢控制。
 # invert=False：手指伸直 -> MOTORS 的 min，握起 -> max。
 # 若某顆馬達實際方向相反，只要把該列改成 invert=True。
-HAND_FINGER_MOTORS = [
-    {"name": "食指", "channel": 0, "landmarks": (5, 6, 7, 8), "invert": False},
-    {"name": "中指", "channel": 1, "landmarks": (9, 10, 11, 12), "invert": False},
-    {"name": "無名指", "channel": 2, "landmarks": (13, 14, 15, 16), "invert": False},
-    {"name": "小指", "channel": 3, "landmarks": (17, 18, 19, 20), "invert": False},
+HAND_CONTROLS = [
+    {"name": "食指", "channel": 0, "metric": "curl", "landmarks": (5, 6, 7, 8), "invert": False},
+    {"name": "中指", "channel": 1, "metric": "curl", "landmarks": (9, 10, 11, 12), "invert": False},
+    {"name": "無名指", "channel": 2, "metric": "curl", "landmarks": (13, 14, 15, 16), "invert": False},
+    {"name": "小指", "channel": 3, "metric": "curl", "landmarks": (17, 18, 19, 20), "invert": False},
+    {"name": "拇指彎曲", "channel": 4, "metric": "curl", "landmarks": (1, 2, 3, 4), "straight_deg": 10.0, "closed_deg": 110.0, "invert": False},
+    {"name": "拇指 CMC", "channel": 5, "metric": "cmc", "invert": False},
 ]
 
 # PIP + DIP 兩個關節的總彎曲角度。低於 STRAIGHT 視為完全伸直，
@@ -54,7 +58,12 @@ HAND_FINGER_MOTORS = [
 HAND_CURL_STRAIGHT_DEG = 15.0
 HAND_CURL_CLOSED_DEG = 150.0
 
-# 0～1；越小越穩定但反應較慢。四指已合併成單一封包，可以每幀更新。
+# 攝影機量到的拇指展開角度：OUTWARD -> CMC 0°，INWARD -> CMC 90°。
+# CMC 的 0～90°會再完整映射到馬達 5 的 min～max（預設 0～180°）。
+THUMB_CMC_OUTWARD_SPREAD_DEG = 55.0
+THUMB_CMC_INWARD_SPREAD_DEG = 15.0
+
+# 0～1；越小越穩定但反應較慢。六個角度共用一個同步封包。
 # 自適應平滑：手指只有小幅抖動時較穩，快速彎曲時則立刻跟上。
 HAND_SMOOTHING_MIN = 0.16
 HAND_SMOOTHING_MAX = 0.82
@@ -63,4 +72,3 @@ HAND_CONTROL_FRAME_INTERVAL = 1
 
 # 預覽不必與辨識同速；降低 UI 圖片縮放負擔，但不降低馬達更新率。
 CAMERA_PREVIEW_INTERVAL_MS = 66
-
