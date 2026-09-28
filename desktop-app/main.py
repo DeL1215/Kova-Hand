@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kova Hand Project
+# SPDX-License-Identifier: MIT
+
 """BLE and MediaPipe backend for the Kova Hand desktop app."""
 
 from __future__ import annotations
@@ -5,8 +8,10 @@ from __future__ import annotations
 import asyncio
 import math
 import queue
+import statistics
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -28,10 +33,16 @@ HAND_CONNECTIONS = (
 
 
 def _joint_angle(a, b, c) -> float:
-    """Return the 3D angle ABC in degrees for MediaPipe landmarks."""
+    """Return the image-plane angle ABC in degrees.
 
-    first = (a.x - b.x, a.y - b.y, a.z - b.z)
-    second = (c.x - b.x, c.y - b.y, c.z - b.z)
+    MediaPipe's normalized-landmark z value is substantially noisier than x/y
+    and changes as the thumb moves toward the camera.  The controller follows a
+    front-facing hand, so using the image plane gives steadier, less coupled
+    finger and thumb measurements.
+    """
+
+    first = (a.x - b.x, a.y - b.y)
+    second = (c.x - b.x, c.y - b.y)
     first_length = math.sqrt(sum(value * value for value in first))
     second_length = math.sqrt(sum(value * value for value in second))
     if first_length < 1e-6 or second_length < 1e-6:
@@ -56,8 +67,44 @@ def finger_curl(
     return max(0.0, min(1.0, (total_bend - straight_deg) / span))
 
 
+def thumb_curl(
+    landmarks,
+    indices: tuple[int, int, int, int] = (1, 2, 3, 4),
+    straight_deg: float = 5.0,
+    closed_deg: float = 75.0,
+) -> float:
+    """Measure thumb flexion without treating it like a four-finger curl.
+
+    The IP joint carries most visible thumb flexion, while the MCP joint adds a
+    smaller contribution. Weighting them separately reduces coupling with the
+    thumb CMC/opposition control.
+    """
+
+    cmc, mcp, ip, tip = (landmarks[index] for index in indices)
+    wrist, index_mcp, pinky_mcp = landmarks[0], landmarks[5], landmarks[17]
+    palm_orientation = (
+        (index_mcp.x - wrist.x) * (pinky_mcp.y - wrist.y)
+        - (index_mcp.y - wrist.y) * (pinky_mcp.x - wrist.x)
+    )
+
+    def signed_bend(a, b, c) -> float:
+        incoming = (b.x - a.x, b.y - a.y)
+        outgoing = (c.x - b.x, c.y - b.y)
+        turn = incoming[0] * outgoing[1] - incoming[1] * outgoing[0]
+        magnitude = 180.0 - _joint_angle(a, b, c)
+        if abs(turn) < 1e-9 or abs(palm_orientation) < 1e-9:
+            return magnitude
+        return magnitude if turn * palm_orientation > 0 else -magnitude
+
+    mcp_bend = signed_bend(cmc, mcp, ip)
+    ip_bend = signed_bend(mcp, ip, tip)
+    weighted_bend = 0.35 * mcp_bend + 0.65 * ip_bend
+    span = max(1.0, closed_deg - straight_deg)
+    return max(0.0, min(1.0, (weighted_bend - straight_deg) / span))
+
+
 def thumb_cmc_inward(landmarks) -> float:
-    """Map thumb opposition from CMC 0° (outward) to 90° (inward)."""
+    """Map thumb opposition from outward to inward."""
 
     spread = _joint_angle(landmarks[2], landmarks[0], landmarks[5])
     span = max(
@@ -77,6 +124,7 @@ class BleController:
         self.dispatch = dispatch
         self.client = None
         self.devices: dict[str, object] = {}
+        self.pending_calibrations: dict[int, tuple[int, int]] = {}
         self.pending_angles: dict[int, int] = {}
         self.pending_hand_angles: tuple[int, ...] | None = None
         self.pending_lock = threading.Lock()
@@ -98,7 +146,11 @@ class BleController:
 
     async def _scan(self):
         if BleakScanner is None:
-            self.dispatch("error", "尚未安裝 bleak，請先執行 pip install -r requirements.txt")
+            self.dispatch(
+                "error",
+                "尚未安裝 bleak，請在專案根目錄執行 "
+                "python -m pip install -r requirements.txt",
+            )
             return
         self.dispatch("status", "正在掃描…")
         try:
@@ -148,8 +200,20 @@ class BleController:
             self.dispatch("status", "正在連線…")
             self.client = BleakClient(device, disconnected_callback=self._disconnected)
             await self.client.connect()
-            self._clear_pending_angles()
+            self._clear_pending()
             self.dispatch("connected", True)
+            try:
+                state = await self.client.read_gatt_char(config.BLE_CHARACTERISTIC_UUID)
+                if len(state) == 6 and all(value <= 180 or value == 255 for value in state):
+                    self.dispatch(
+                        "angles",
+                        {
+                            channel: None if value == 255 else value
+                            for channel, value in enumerate(state)
+                        },
+                    )
+            except Exception:
+                self.dispatch("status", "已連線 · 韌體未提供角度狀態")
         except Exception as exc:
             self.client = None
             self.dispatch("error", f"連線失敗：{exc}")
@@ -157,13 +221,13 @@ class BleController:
     async def _disconnect(self):
         client = self.client
         self.client = None
-        self._clear_pending_angles()
+        self._clear_pending()
         if client and client.is_connected:
             await client.disconnect()
         self.dispatch("connected", False)
 
     def _disconnected(self, _client):
-        self._clear_pending_angles()
+        self._clear_pending()
         self.dispatch("connected", False)
 
     def send_angle(self, channel: int, angle: int):
@@ -171,7 +235,14 @@ class BleController:
             return
         with self.pending_lock:
             # 同一通道尚未送出的舊角度直接被新角度取代，不讓延遲持續累積。
+            self.pending_hand_angles = None
             self.pending_angles[channel] = angle
+
+    def send_servo_calibration(self, calibration: dict[int, tuple[int, int]]):
+        if not self.client or not self.client.is_connected:
+            return
+        with self.pending_lock:
+            self.pending_calibrations.update(calibration)
 
     def send_hand_angles(self, angles: dict[int, int]):
         """Queue one compact binary packet containing all six channels."""
@@ -182,10 +253,12 @@ class BleController:
             return
         values = tuple(max(0, min(180, round(angles[channel]))) for channel in range(6))
         with self.pending_lock:
+            self.pending_angles.clear()
             self.pending_hand_angles = values
 
-    def _clear_pending_angles(self):
+    def _clear_pending(self):
         with self.pending_lock:
+            self.pending_calibrations.clear()
             self.pending_angles.clear()
             self.pending_hand_angles = None
 
@@ -196,7 +269,11 @@ class BleController:
         while not self.closing.is_set():
             command = None
             with self.pending_lock:
-                if self.pending_angles:
+                if self.pending_calibrations:
+                    channel = next(iter(self.pending_calibrations))
+                    minimum, maximum = self.pending_calibrations.pop(channel)
+                    command = f"C,{channel},{minimum},{maximum}\n".encode("ascii")
+                elif self.pending_angles:
                     channel = next(iter(self.pending_angles))
                     angle = self.pending_angles.pop(channel)
                     command = f"S,{channel},{angle}\n".encode("ascii")
@@ -218,14 +295,14 @@ class BleController:
                         response=False,
                     )
                 except Exception as exc:
-                    self._clear_pending_angles()
+                    self._clear_pending()
                     self.dispatch("error", f"傳送失敗：{exc}")
 
             await asyncio.sleep(interval)
 
     def close(self):
         self.closing.set()
-        self._clear_pending_angles()
+        self._clear_pending()
 
         async def disconnect():
             if self.client and self.client.is_connected:
@@ -254,6 +331,7 @@ class HandTracker:
         self.latest_frame = None
         self.running = False
         self.smoothed_controls: dict[int, float] = {}
+        self.control_history: dict[int, deque[float]] = {}
         self.last_preview_at = 0.0
 
     def start(self):
@@ -261,6 +339,7 @@ class HandTracker:
             return
         self.stop_event.clear()
         self.smoothed_controls.clear()
+        self.control_history.clear()
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -281,16 +360,32 @@ class HandTracker:
         return frame
 
     def _smooth(self, channel: int, measured: float) -> float:
-        previous = self.smoothed_controls.get(channel, measured)
-        if measured in (0.0, 1.0):
-            result = measured
+        measured = max(0.0, min(1.0, measured))
+        history = self.control_history.setdefault(
+            channel,
+            deque(maxlen=max(1, config.HAND_FILTER_WINDOW)),
+        )
+        history.append(measured)
+        target = statistics.median(history)
+        previous = self.smoothed_controls.get(channel, target)
+        movement = target - previous
+
+        if abs(movement) <= config.HAND_DEAD_ZONE:
+            result = previous
         else:
-            movement = abs(measured - previous)
             amount = min(
                 config.HAND_SMOOTHING_MAX,
-                config.HAND_SMOOTHING_MIN + movement * config.HAND_SMOOTHING_RESPONSE,
+                config.HAND_SMOOTHING_MIN
+                + abs(movement) * config.HAND_SMOOTHING_RESPONSE,
             )
-            result = previous + amount * (measured - previous)
+            step = amount * movement
+            step = max(
+                -config.HAND_MAX_DELTA_PER_UPDATE,
+                min(config.HAND_MAX_DELTA_PER_UPDATE, step),
+            )
+            result = previous + step
+
+        result = max(0.0, min(1.0, result))
         self.smoothed_controls[channel] = result
         return result
 
@@ -317,7 +412,10 @@ class HandTracker:
 
             model_path = Path(__file__).resolve().parent / config.HAND_MODEL_PATH
             if not model_path.exists():
-                raise FileNotFoundError(f"找不到模型：{model_path}")
+                raise FileNotFoundError(
+                    f"找不到模型：{model_path}。請在專案根目錄執行 "
+                    "python scripts/download_hand_model.py"
+                )
 
             capture, camera_index = self._open_camera(cv2)
             if capture is None:
@@ -332,9 +430,9 @@ class HandTracker:
                 base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
                 running_mode=mp.tasks.vision.RunningMode.VIDEO,
                 num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_hand_detection_confidence=config.HAND_MIN_DETECTION_CONFIDENCE,
+                min_hand_presence_confidence=config.HAND_MIN_PRESENCE_CONFIDENCE,
+                min_tracking_confidence=config.HAND_MIN_TRACKING_CONFIDENCE,
             )
             landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
             self.events.put(("started", camera_index))
@@ -358,21 +456,25 @@ class HandTracker:
 
                 height, width = rgb.shape[:2]
                 left_hand = None
+                candidates = []
                 for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
-                    label = handedness[0].category_name if handedness else ""
-                    if label != config.HAND_LABEL_FOR_PHYSICAL_LEFT:
-                        continue
-                    left_hand = landmarks
+                    category = handedness[0] if handedness else None
+                    label = category.category_name if category else ""
+                    score = category.score if category else 0.0
+                    if label == config.HAND_LABEL_FOR_PHYSICAL_LEFT:
+                        candidates.append((score, landmarks))
+
+                if candidates:
+                    _, left_hand = max(candidates, key=lambda item: item[0])
                     points = [
                         (int(mark.x * width), int(mark.y * height))
-                        for mark in landmarks
+                        for mark in left_hand
                     ]
                     for start, end in HAND_CONNECTIONS:
                         cv2.line(rgb, points[start], points[end], (255, 255, 255), 2, cv2.LINE_AA)
                     for point in points:
                         cv2.circle(rgb, point, 4, (23, 105, 224), -1, cv2.LINE_AA)
                         cv2.circle(rgb, point, 6, (255, 255, 255), 1, cv2.LINE_AA)
-                    break
 
                 if left_hand is not None:
                     overlay_text = "LEFT HAND"
@@ -400,16 +502,22 @@ class HandTracker:
                 if left_hand is not None and frame_count % config.HAND_CONTROL_FRAME_INTERVAL == 0:
                     controls = {}
                     for control in config.HAND_CONTROLS:
-                        measured = (
-                            finger_curl(
+                        if control["metric"] == "curl":
+                            measured = finger_curl(
                                 left_hand,
                                 control["landmarks"],
                                 control.get("straight_deg", config.HAND_CURL_STRAIGHT_DEG),
                                 control.get("closed_deg", config.HAND_CURL_CLOSED_DEG),
                             )
-                            if control["metric"] == "curl"
-                            else thumb_cmc_inward(left_hand)
-                        )
+                        elif control["metric"] == "thumb_curl":
+                            measured = thumb_curl(
+                                left_hand,
+                                control["landmarks"],
+                                control["straight_deg"],
+                                control["closed_deg"],
+                            )
+                        else:
+                            measured = thumb_cmc_inward(left_hand)
                         channel = control["channel"]
                         controls[channel] = self._smooth(channel, measured)
                     self.events.put(("hand_controls", controls))
@@ -422,7 +530,11 @@ class HandTracker:
                         else "請將左手放入畫面",
                     ))
         except ImportError:
-            self.events.put(("error", "缺少 MediaPipe 套件，請重新安裝 requirements.txt"))
+            self.events.put((
+                "error",
+                "缺少 MediaPipe 套件，請在專案根目錄執行 "
+                "python -m pip install -r requirements.txt",
+            ))
         except Exception as exc:
             self.events.put(("error", str(exc)))
         finally:
@@ -438,4 +550,3 @@ if __name__ == "__main__":
     from qt_ui import run
 
     raise SystemExit(run(BleController, HandTracker))
-

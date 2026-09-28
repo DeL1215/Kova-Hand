@@ -1,0 +1,2 @@
+# Canonical dependency entry point for installing from the repository root.
+-r desktop-app/requirements.txt

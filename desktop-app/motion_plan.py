@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kova Hand Project
+# SPDX-License-Identifier: MIT
+
 """Parse the compact hand-motion DSL returned by the language model."""
 
 from __future__ import annotations
@@ -5,7 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 MAX_STEPS = 20
@@ -25,11 +28,16 @@ class PoseStep:
 
 
 @dataclass(frozen=True)
+class AngleStep:
+    values: tuple[int | None, ...]
+
+
+@dataclass(frozen=True)
 class WaitStep:
     milliseconds: int
 
 
-MotionStep = PoseStep | WaitStep
+MotionStep = PoseStep | AngleStep | WaitStep
 
 
 def load_gesture_presets(path: Path = PRESET_PATH) -> dict[str, tuple[int, ...]]:
@@ -52,7 +60,9 @@ def load_gesture_presets(path: Path = PRESET_PATH) -> dict[str, tuple[int, ...]]
 
 
 def parse_motion_plan(
-    text: str, presets: Mapping[str, tuple[int, ...]] | None = None
+    text: str,
+    presets: Mapping[str, tuple[int, ...]] | None = None,
+    angle_ranges: Sequence[tuple[int, int]] | None = None,
 ) -> list[MotionStep]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not 1 <= len(lines) <= MAX_STEPS:
@@ -77,6 +87,23 @@ def parse_motion_plan(
                     raise MotionPlanError("關節值必須介於 0～100")
                 values.append(value)
             steps.append(PoseStep(tuple(values)))
+        elif line.startswith("A:"):
+            tokens = [token.strip() for token in line[2:].split(",")]
+            if len(tokens) != JOINT_COUNT or not angle_ranges or len(angle_ranges) != JOINT_COUNT:
+                raise MotionPlanError("A 必須包含六個有效馬達角度")
+            values = []
+            for channel, (token, (minimum, maximum)) in enumerate(zip(tokens, angle_ranges)):
+                if token == "-":
+                    values.append(None)
+                    continue
+                try:
+                    value = int(token)
+                except ValueError as error:
+                    raise MotionPlanError(f"無效馬達角度：{token}") from error
+                if not minimum <= value <= maximum:
+                    raise MotionPlanError(f"馬達 {channel} 角度必須介於 {minimum}～{maximum}")
+                values.append(value)
+            steps.append(AngleStep(tuple(values)))
         elif line.startswith("P:"):
             name = line[2:].strip()
             if not presets or name not in presets:
@@ -93,8 +120,15 @@ def parse_motion_plan(
         else:
             raise MotionPlanError(f"未知模組：{line}")
 
-    if not isinstance(steps[0], PoseStep) or not isinstance(steps[-1], PoseStep):
-        raise MotionPlanError("動作序列的開頭與結尾必須是 H")
+    action_types = (PoseStep, AngleStep)
+    if not isinstance(steps[0], action_types) or not isinstance(steps[-1], action_types):
+        raise MotionPlanError("動作序列的開頭與結尾必須是 H、P 或 A")
     if any(isinstance(a, WaitStep) and isinstance(b, WaitStep) for a, b in zip(steps, steps[1:])):
         raise MotionPlanError("W 不得連續")
+    if not any(
+        isinstance(step, action_types)
+        and any(value is not None for value in step.values)
+        for step in steps
+    ):
+        raise MotionPlanError("動作序列沒有任何可執行的關節值")
     return steps

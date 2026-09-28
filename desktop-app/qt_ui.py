@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Kova Hand Project
+# SPDX-License-Identifier: MIT
+
 """Qt presentation layer for Kova Hand.
 
 The BLE, MediaPipe, and AI workers are injected from main.py.  This module owns
@@ -13,22 +16,40 @@ import time
 from pathlib import Path
 
 import config
-from ai_chat import AiChatClient
-from motion_plan import MotionPlanError, MotionStep, PoseStep, WaitStep, parse_motion_plan
-from PySide6.QtCore import QByteArray, QObject, QSize, Qt, QTimer, Signal
+from ai_chat import (
+    PROVIDERS,
+    AiChatClient,
+    LlmSettings,
+    save_llm_settings,
+    validate_llm_settings,
+)
+from motion_plan import (
+    AngleStep,
+    MotionPlanError,
+    MotionStep,
+    PoseStep,
+    WaitStep,
+    parse_motion_plan,
+)
+from PySide6.QtCore import QByteArray, QObject, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGraphicsDropShadowEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStackedLayout,
     QTextEdit,
@@ -118,6 +139,29 @@ QSlider::handle:horizontal {{
     border-radius: 8px;
 }}
 QSlider::handle:horizontal:hover {{ border-color: {ACCENT}; }}
+QSpinBox#MotorAngle {{
+    background: #FBFBFC;
+    border: 1px solid {FIELD_BORDER};
+    border-radius: 8px;
+    padding: 2px 8px;
+}}
+QSpinBox#MotorAngle:focus {{ border-color: {ACCENT}; }}
+QSpinBox#CalibrationValue {{
+    min-height: 34px;
+    background: #FBFBFC;
+    border: 1px solid {FIELD_BORDER};
+    border-radius: 9px;
+    padding: 0 10px;
+}}
+QSpinBox#CalibrationValue:focus {{ border-color: {ACCENT}; }}
+QLineEdit#SettingsField {{
+    min-height: 36px;
+    background: #FBFBFC;
+    border: 1px solid {FIELD_BORDER};
+    border-radius: 9px;
+    padding: 0 11px;
+}}
+QLineEdit#SettingsField:focus {{ border-color: {ACCENT}; }}
 QSplitter::handle {{ background: transparent; width: 14px; }}
 """
 
@@ -213,9 +257,18 @@ class MotorRow(QWidget):
         name = QLabel(motor["title"])
         name.setFont(_font(11, QFont.Weight.DemiBold))
         name.setFixedWidth(140)
-        self.value_label = QLabel(f'{motor["initial"]}°')
-        self.value_label.setFont(_font(17, QFont.Weight.Bold, mono=True))
-        self.value_label.setFixedWidth(62)
+        self.value_input = QSpinBox()
+        self.value_input.setObjectName("MotorAngle")
+        self.unknown_value = motor["min"] - 1
+        self.value_input.setRange(self.unknown_value, motor["max"])
+        self.value_input.setSpecialValueText("—")
+        self.value_input.setValue(self.unknown_value)
+        self.value_input.setSuffix("°")
+        self.value_input.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.value_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.value_input.setKeyboardTracking(False)
+        self.value_input.setFont(_font(15, QFont.Weight.Bold, mono=True))
+        self.value_input.setFixedSize(70, 34)
 
         control = QWidget()
         control_layout = QVBoxLayout(control)
@@ -237,20 +290,40 @@ class MotorRow(QWidget):
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(motor["min"], motor["max"])
-        self.slider.setValue(motor["initial"])
+        self.slider.setValue(motor["min"])
         self.slider.setSingleStep(1)
         self.slider.setFixedHeight(24)
         self.slider.valueChanged.connect(self._value_changed)
+        self.value_input.valueChanged.connect(self._input_changed)
         control_layout.addLayout(labels)
         control_layout.addWidget(self.slider)
 
         layout.addWidget(name)
-        layout.addWidget(self.value_label)
+        layout.addWidget(self.value_input)
         layout.addWidget(control, 1)
 
     def _value_changed(self, angle: int) -> None:
-        self.value_label.setText(f"{angle}°")
+        self.value_input.blockSignals(True)
+        self.value_input.setValue(angle)
+        self.value_input.blockSignals(False)
         self.changed(self.motor["channel"], angle)
+
+    def _input_changed(self, angle: int) -> None:
+        if angle < self.motor["min"]:
+            return
+        if self.slider.value() == angle:
+            self.changed(self.motor["channel"], angle)
+        else:
+            self.slider.setValue(angle)
+
+    def current_value(self) -> int | None:
+        value = self.value_input.value()
+        return None if value == self.unknown_value else value
+
+    def set_unknown(self) -> None:
+        self.value_input.blockSignals(True)
+        self.value_input.setValue(self.unknown_value)
+        self.value_input.blockSignals(False)
 
     def center(self) -> None:
         self.slider.setValue(round((self.motor["min"] + self.motor["max"]) / 2))
@@ -260,8 +333,179 @@ class MotorRow(QWidget):
         self.slider.blockSignals(True)
         self.slider.setValue(value)
         self.slider.blockSignals(False)
-        self.value_label.setText(f"{value}°")
+        self.value_input.blockSignals(True)
+        self.value_input.setValue(value)
+        self.value_input.blockSignals(False)
         return value
+
+
+class ServoCalibrationDialog(QDialog):
+    def __init__(self, values: dict[int, tuple[int, int]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("馬達 PWM 端點校正")
+        self.setMinimumWidth(560)
+        self.inputs: dict[int, tuple[QSpinBox, QSpinBox]] = {}
+
+        page = QVBoxLayout(self)
+        page.setContentsMargins(24, 22, 24, 22)
+        page.setSpacing(16)
+        title = QLabel("馬達 PWM 端點校正")
+        title.setFont(_font(16, QFont.Weight.Bold))
+        note = QLabel("角度仍顯示 0～180°；端點決定 PCA9685 實際輸出的脈寬。請逐步調整，避免撞到機械限位。")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{MUTED};")
+        page.addWidget(title)
+        page.addWidget(note)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        for column, text in enumerate(("馬達", "0° 端點", "180° 端點")):
+            label = QLabel(text)
+            label.setFont(_font(10, QFont.Weight.DemiBold))
+            label.setStyleSheet(f"color:{MUTED};")
+            grid.addWidget(label, 0, column)
+
+        low, high = config.SERVO_PWM_LIMITS
+        for row, motor in enumerate(config.MOTORS, start=1):
+            channel = motor["channel"]
+            minimum, maximum = values[channel]
+            name = QLabel(motor["title"])
+            name.setFont(_font(11, QFont.Weight.DemiBold))
+            minimum_input = self._pulse_input(minimum, low, high)
+            maximum_input = self._pulse_input(maximum, low, high)
+            self.inputs[channel] = (minimum_input, maximum_input)
+            grid.addWidget(name, row, 0)
+            grid.addWidget(minimum_input, row, 1)
+            grid.addWidget(maximum_input, row, 2)
+        page.addLayout(grid)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("取消")
+        cancel.setProperty("variant", "secondary")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("儲存校正")
+        save.setProperty("variant", "blue")
+        save.clicked.connect(self._validate_and_accept)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        page.addLayout(actions)
+
+    @staticmethod
+    def _pulse_input(value: int, minimum: int, maximum: int) -> QSpinBox:
+        field = QSpinBox()
+        field.setObjectName("CalibrationValue")
+        field.setRange(minimum, maximum)
+        field.setValue(value)
+        field.setSuffix(" tick")
+        field.setAlignment(Qt.AlignmentFlag.AlignRight)
+        field.setFixedWidth(130)
+        return field
+
+    def calibration(self) -> dict[int, tuple[int, int]]:
+        return {
+            channel: (minimum.value(), maximum.value())
+            for channel, (minimum, maximum) in self.inputs.items()
+        }
+
+    def _validate_and_accept(self) -> None:
+        for channel, (minimum, maximum) in self.calibration().items():
+            if maximum - minimum < config.SERVO_PWM_MIN_SPAN:
+                QMessageBox.warning(
+                    self,
+                    "端點範圍無效",
+                    f"馬達 {channel} 的兩個端點至少需要相差 {config.SERVO_PWM_MIN_SPAN} tick。",
+                )
+                return
+        self.accept()
+
+
+class LlmSettingsDialog(QDialog):
+    def __init__(self, current: LlmSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("模型服務設定")
+        self.setMinimumWidth(580)
+
+        page = QVBoxLayout(self)
+        page.setContentsMargins(24, 22, 24, 22)
+        page.setSpacing(16)
+        title = QLabel("模型服務設定")
+        title.setFont(_font(16, QFont.Weight.Bold))
+        note = QLabel("可使用 OpenRouter、OpenAI，或任何支援 OpenAI Chat Completions 的服務。設定會保存在專案根目錄的 .env。")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{MUTED};")
+        page.addWidget(title)
+        page.addWidget(note)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(12)
+        self.provider_box = QComboBox()
+        self.provider_box.setFixedHeight(38)
+        for provider, details in PROVIDERS.items():
+            self.provider_box.addItem(details["label"], provider)
+        self.provider_box.setCurrentIndex(
+            max(0, self.provider_box.findData(current.provider))
+        )
+        self.api_key_input = self._field(current.api_key)
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.setPlaceholderText("自訂本機服務可留空")
+        self.base_url_input = self._field(current.base_url)
+        self.model_input = self._field(current.model)
+        for row, (label_text, field) in enumerate((
+            ("供應商", self.provider_box),
+            ("API Key", self.api_key_input),
+            ("Base URL", self.base_url_input),
+            ("模型 ID", self.model_input),
+        )):
+            label = QLabel(label_text)
+            label.setFont(_font(11, QFont.Weight.DemiBold))
+            form.addWidget(label, row, 0)
+            form.addWidget(field, row, 1)
+        form.setColumnStretch(1, 1)
+        page.addLayout(form)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("取消")
+        _set_variant(cancel, "secondary")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("儲存設定")
+        _set_variant(save, "blue")
+        save.clicked.connect(self._validate_and_accept)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        page.addLayout(actions)
+        self.provider_box.currentIndexChanged.connect(self._provider_changed)
+
+    @staticmethod
+    def _field(value: str) -> QLineEdit:
+        field = QLineEdit(value)
+        field.setObjectName("SettingsField")
+        return field
+
+    def settings(self) -> LlmSettings:
+        return LlmSettings(
+            provider=str(self.provider_box.currentData()),
+            api_key=self.api_key_input.text().strip(),
+            base_url=self.base_url_input.text().strip().rstrip("/"),
+            model=self.model_input.text().strip(),
+        )
+
+    def _provider_changed(self) -> None:
+        preset = PROVIDERS[str(self.provider_box.currentData())]
+        self.base_url_input.setText(preset["base_url"])
+        self.model_input.setText(preset["model"])
+        self.api_key_input.clear()
+
+    def _validate_and_accept(self) -> None:
+        try:
+            validate_llm_settings(self.settings())
+        except ValueError as error:
+            QMessageBox.warning(self, "模型設定不完整", str(error))
+            return
+        self.accept()
 
 
 class KovaQtWindow(QMainWindow):
@@ -277,6 +521,8 @@ class KovaQtWindow(QMainWindow):
         self.controller = controller_type(lambda event, payload: self.bridge.ble.emit(event, payload))
         self.hand_tracker = tracker_type()
         self.ai_chat = AiChatClient()
+        self.settings = QSettings("Kova Hand", "Control")
+        self.servo_calibration = self._load_servo_calibration()
         self.connected = False
         self.hand_enabled = False
         self.ai_plan: list[MotionStep] = []
@@ -388,9 +634,13 @@ class KovaQtWindow(QMainWindow):
         header = QHBoxLayout()
         title = QLabel("馬達控制")
         title.setFont(_font(15, QFont.Weight.Bold))
+        calibrate = self._button(
+            "校正端點", "adjustments-horizontal", "secondary", self._open_calibration, 112
+        )
         center = self._button("全部置中", "layout-align-center", "secondary", self._center_all, 104)
         header.addWidget(title)
         header.addStretch()
+        header.addWidget(calibrate)
         header.addWidget(center)
         layout.addLayout(header)
         self.motor_rows = []
@@ -459,18 +709,27 @@ class KovaQtWindow(QMainWindow):
         meta = QHBoxLayout()
         title = QLabel("AI 控制")
         title.setFont(_font(15, QFont.Weight.Bold))
+        provider_label = QLabel("供應商")
+        provider_label.setFont(_font(10))
+        provider_label.setStyleSheet(f"color:{MUTED};")
+        self.ai_provider_label = QLabel()
+        self.ai_provider_label.setFont(_font(10))
         model_label = QLabel("模型")
         model_label.setFont(_font(10))
         model_label.setStyleSheet(f"color:{MUTED};")
-        model = QLabel(self.ai_chat.model)
-        model.setFont(_font(10))
+        self.ai_model_label = QLabel()
+        self.ai_model_label.setFont(_font(10))
+        self.ai_model_label.setMaximumWidth(260)
         self.ai_status_label = QLabel("待命")
         self.ai_status_label.setFont(_font(10))
         self.ai_status_label.setStyleSheet(f"color:{MUTED};")
         meta.addWidget(title)
         meta.addSpacing(18)
+        meta.addWidget(provider_label)
+        meta.addWidget(self.ai_provider_label)
+        meta.addSpacing(16)
         meta.addWidget(model_label)
-        meta.addWidget(model)
+        meta.addWidget(self.ai_model_label)
         meta.addSpacing(16)
         status_label = QLabel("狀態")
         status_label.setFont(_font(10))
@@ -478,6 +737,11 @@ class KovaQtWindow(QMainWindow):
         meta.addWidget(status_label)
         meta.addWidget(self.ai_status_label)
         meta.addStretch()
+        self.llm_settings_button = self._button(
+            "模型設定", "adjustments-horizontal", "secondary", self._open_llm_settings, 112
+        )
+        meta.addWidget(self.llm_settings_button)
+        self._update_llm_labels()
         outer.addLayout(meta)
 
         body = QSplitter(Qt.Orientation.Horizontal)
@@ -563,6 +827,21 @@ class KovaQtWindow(QMainWindow):
                 _svg_icon("unlink" if self.connected else "link", "#FFFFFF")
             )
             _set_variant(self.connect_button, "danger" if self.connected else "dark")
+            if self.connected:
+                self._sync_servo_calibration()
+        elif event == "angles":
+            for channel, angle in payload.items():
+                row = self.motor_rows_by_channel.get(channel)
+                if row is None:
+                    continue
+                row.set_unknown() if angle is None else row.set_external_value(angle)
+            unknown_count = sum(angle is None for angle in payload.values())
+            if unknown_count == len(payload):
+                self.status_label.setText("已連線 · 目前角度未知")
+            elif unknown_count:
+                self.status_label.setText("已連線 · 部分角度未知")
+            else:
+                self.status_label.setText("已連線 · 角度已同步")
         elif event == "error":
             self.scan_button.setEnabled(True)
             self.status_dot.set_color(RED)
@@ -573,28 +852,64 @@ class KovaQtWindow(QMainWindow):
         if self.connected:
             self.controller.send_angle(channel, angle)
 
+    def _current_angles(self) -> dict[int, int]:
+        return {
+            channel: angle
+            for channel, row in self.motor_rows_by_channel.items()
+            if (angle := row.current_value()) is not None
+        }
+
     def _center_all(self) -> None:
         for row in self.motor_rows:
             row.center()
 
+    def _load_servo_calibration(self) -> dict[int, tuple[int, int]]:
+        result = {}
+        low, high = config.SERVO_PWM_LIMITS
+        for channel, defaults in config.SERVO_PWM_DEFAULTS.items():
+            minimum = int(self.settings.value(f"servo_pwm/{channel}/min", defaults[0]))
+            maximum = int(self.settings.value(f"servo_pwm/{channel}/max", defaults[1]))
+            valid = low <= minimum and maximum <= high and maximum - minimum >= config.SERVO_PWM_MIN_SPAN
+            result[channel] = (minimum, maximum) if valid else defaults
+        return result
+
+    def _open_calibration(self) -> None:
+        dialog = ServoCalibrationDialog(self.servo_calibration, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.servo_calibration = dialog.calibration()
+        for channel, (minimum, maximum) in self.servo_calibration.items():
+            self.settings.setValue(f"servo_pwm/{channel}/min", minimum)
+            self.settings.setValue(f"servo_pwm/{channel}/max", maximum)
+        self.settings.sync()
+        self._sync_servo_calibration()
+
+    def _sync_servo_calibration(self) -> None:
+        if self.connected:
+            self.controller.send_servo_calibration(self.servo_calibration)
+
     def _apply_controls(
         self, values: dict[int, float], preserve_unspecified: bool = False
     ) -> None:
-        angles = {}
+        angles = self._current_angles() if preserve_unspecified else {}
+        changed = {}
         for control in config.HAND_CONTROLS:
             channel = control["channel"]
             row = self.motor_rows_by_channel.get(channel)
             if row is None:
                 continue
             if channel not in values:
-                if preserve_unspecified:
-                    angles[channel] = row.slider.value()
                 continue
             amount = 1.0 - values[channel] if control.get("invert") else values[channel]
             target = row.motor["min"] + amount * (row.motor["max"] - row.motor["min"])
-            angles[channel] = row.set_external_value(target)
-        if self.connected and len(angles) == 6:
+            changed[channel] = angles[channel] = row.set_external_value(target)
+        if not self.connected or not changed:
+            return
+        if len(angles) == 6:
             self.controller.send_hand_angles(angles)
+        else:
+            for channel, angle in changed.items():
+                self.controller.send_angle(channel, angle)
 
     def _apply_hand_controls(self, values: dict[int, float]) -> None:
         self._apply_controls(values)
@@ -606,6 +921,22 @@ class KovaQtWindow(QMainWindow):
             if value is not None
         }
         self._apply_controls(values, preserve_unspecified=True)
+
+    def _apply_ai_angles(self, step: AngleStep) -> None:
+        angles = self._current_angles()
+        changed = {}
+        for channel, value in enumerate(step.values):
+            if value is not None:
+                changed[channel] = angles[channel] = self.motor_rows_by_channel[
+                    channel
+                ].set_external_value(value)
+        if not self.connected or not changed:
+            return
+        if len(angles) == 6:
+            self.controller.send_hand_angles(angles)
+        else:
+            for channel, angle in changed.items():
+                self.controller.send_angle(channel, angle)
 
     def _send_ai_message(self) -> None:
         message = self.ai_input.toPlainText().strip()
@@ -619,6 +950,7 @@ class KovaQtWindow(QMainWindow):
             return
         self.ai_input.clear()
         self.ai_send_button.setEnabled(False)
+        self.llm_settings_button.setEnabled(False)
         self.hand_button.setEnabled(False)
         self.ai_status_label.setText("正在等待模型回覆")
         self.ai_status_label.setStyleSheet(f"color:{ACCENT};")
@@ -632,22 +964,27 @@ class KovaQtWindow(QMainWindow):
             self.bridge.ai.emit("error", str(error))
 
     def _handle_ai_event(self, event: str, message: str) -> None:
-        self._append_ai_message("AI" if event == "reply" else "後台", message)
         if event == "error":
+            self._append_ai_message("後台", message)
             self.ai_status_label.setText("請檢查設定")
             self.ai_status_label.setStyleSheet(f"color:{RED};")
             self.ai_send_button.setEnabled(True)
+            self.llm_settings_button.setEnabled(True)
             self.hand_button.setEnabled(True)
             return
         try:
-            plan = parse_motion_plan(message, self.ai_chat.gestures)
+            plan = parse_motion_plan(
+                message, self.ai_chat.gestures, self.ai_chat.angle_ranges
+            )
         except MotionPlanError as error:
-            self._append_ai_message("後台", f"動作格式無效：{error}")
+            self._append_ai_message("後台", f"模型輸出不是有效動作：{error}")
             self.ai_status_label.setText("動作格式無效")
             self.ai_status_label.setStyleSheet(f"color:{RED};")
             self.ai_send_button.setEnabled(True)
+            self.llm_settings_button.setEnabled(True)
             self.hand_button.setEnabled(True)
             return
+        self._append_ai_message("AI", message)
         self._start_ai_plan(plan)
 
     def _start_ai_plan(self, plan: list[MotionStep]) -> None:
@@ -661,6 +998,7 @@ class KovaQtWindow(QMainWindow):
             self.ai_status_label.setText("動作完成" if self.connected else "動作預覽完成 · 尚未連線")
             self.ai_status_label.setStyleSheet(f"color:{GREEN if self.connected else MUTED};")
             self.ai_send_button.setEnabled(True)
+            self.llm_settings_button.setEnabled(True)
             self.hand_button.setEnabled(True)
             return
 
@@ -672,6 +1010,10 @@ class KovaQtWindow(QMainWindow):
             self.ai_status_label.setText(f"執行動作 {progress}")
             self._apply_ai_pose(step)
             self.ai_motion_timer.start(config.AI_ACTION_INTERVAL_MS)
+        elif isinstance(step, AngleStep):
+            self.ai_status_label.setText(f"設定角度 {progress}")
+            self._apply_ai_angles(step)
+            self.ai_motion_timer.start(config.AI_ACTION_INTERVAL_MS)
         elif isinstance(step, WaitStep):
             self.ai_status_label.setText(f"等待 {step.milliseconds / 1000:g} 秒 · {progress}")
             self.ai_motion_timer.start(step.milliseconds)
@@ -681,6 +1023,31 @@ class KovaQtWindow(QMainWindow):
             self.ai_output.append("")
         self.ai_output.append(f"{role}\n{message}")
         self.ai_output.verticalScrollBar().setValue(self.ai_output.verticalScrollBar().maximum())
+
+    def _open_llm_settings(self) -> None:
+        dialog = LlmSettingsDialog(self.ai_chat.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.settings()
+        try:
+            save_llm_settings(settings)
+        except OSError as error:
+            QMessageBox.critical(self, "無法儲存模型設定", str(error))
+            return
+        self.ai_chat.configure(settings)
+        self._update_llm_labels()
+        self.ai_status_label.setText("設定已更新")
+        self.ai_status_label.setStyleSheet(f"color:{GREEN};")
+        self._append_ai_message(
+            "後台", f"已切換至 {settings.provider_label} · {settings.model}。"
+        )
+
+    def _update_llm_labels(self) -> None:
+        settings = self.ai_chat.settings
+        self.ai_provider_label.setText(settings.provider_label)
+        self.ai_provider_label.setToolTip(settings.base_url)
+        self.ai_model_label.setText(settings.model)
+        self.ai_model_label.setToolTip(settings.model)
 
     def _toggle_hand_tracking(self) -> None:
         if self.hand_enabled:
